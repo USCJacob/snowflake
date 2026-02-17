@@ -1,0 +1,114 @@
+What you’re building (in one line)
+
+You give each request (or each model instance) a contiguous virtual KV address space, but you only back the active KV blocks with real GPU physical memory pages. When the request grows or shrinks, you map/unmap pages instead of reserving peak KV up front.
+
+Implementation: what the system actually looks like
+1) Decide the KV “page” abstraction
+
+You first pick a block/page unit for KV (commonly “tokens-per-block”, e.g., 16/32/64 tokens per block per layer/head layout).
+
+Typical layout choice:
+
+KV is stored per layer as something like:
+K: [num_blocks, block_tokens, num_heads, head_dim]
+V: [num_blocks, block_tokens, num_heads, head_dim]
+
+You want pages to be:
+
+big enough to amortize mapping overhead,
+
+small enough to avoid internal fragmentation,
+
+aligned to whatever your GPU mapping APIs require.
+
+2) Reserve a large virtual region for KV
+
+At process startup (or model load), you reserve a big virtual address range for KV:
+
+Reserve VA for K and V (often separate VA ranges).
+
+This reservation is cheap compared to physically allocating all that memory.
+
+Conceptually:
+
+“This model can address up to N blocks of KV”
+
+But physically you might only back 10–30% at any moment.
+
+3) Build a physical page pool + allocator
+
+You maintain a pool of physical GPU memory:
+
+Allocate physical pages in chunks (to reduce overhead).
+
+Track free lists / buddy allocator style bookkeeping.
+
+Optionally keep per-stream/per-model sub-pools to reduce contention.
+
+Data structures you’ll have:
+
+free_pages: stack/queue of available physical pages
+
+in_use_pages: refcounted pages pinned by in-flight kernels
+
+stats: high-water mark, failures, churn rate
+
+4) Maintain a “page table” (mapping metadata)
+
+You need metadata that maps:
+
+logical KV block id → virtual address offset → physical page
+
+Common pattern:
+
+The engine uses a logical block id per sequence (like PageAttention).
+
+Your layer translates that into:
+
+a VA pointer (stable),
+
+which is currently mapped to some physical page (or not mapped yet).
+
+This mapping must support:
+
+fast lookup (hot path),
+
+batch updates (map/unmap multiple pages at once),
+
+concurrency (multiple requests and streams).
+
+5) Map/unmap on demand (“pager”)
+
+When a request needs a new KV block:
+
+allocate a physical page from the pool
+
+map it into the request’s KV virtual region at the correct offset
+
+update metadata so attention kernels can access it
+
+When a request finishes (or blocks are no longer needed):
+
+ensure no kernel is still using the page (pin/refcount + sync)
+
+unmap that VA range
+
+return physical page to the pool
+
+6) Integrate with the attention path
+
+Two common integration options:
+
+Option A: Minimal kernel changes
+
+Kernels are handed real pointers into the VA region (which is stable).
+
+As long as the VA is mapped before launch, kernels don’t care.
+
+Option B: Keep “logical block tables” like PagedAttention
+
+Your runtime still passes a block table to kernels.
+
+But now the “physical” side is the mapped VA pages rather than a manually-managed contiguous buffer.
+
+Option A is the dream, but you still must guarantee mapping is valid before kernels touch it.
